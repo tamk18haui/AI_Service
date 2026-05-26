@@ -1,9 +1,11 @@
 import asyncio
 import base64
+import hashlib
 import json
 import os
 from contextlib import asynccontextmanager
 from io import BytesIO
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -34,15 +36,27 @@ TEXT_MODEL_NAME = os.getenv(
 VISION_MODEL_NAME = os.getenv("VISION_MODEL_NAME", "facebook/dinov2-base")
 DETECT_MODEL_NAME = os.getenv("DETECT_MODEL_NAME", "google/owlvit-base-patch32")
 
-IMAGE_MATCH_THRESHOLD = float(os.getenv("IMAGE_MATCH_THRESHOLD", "0.42"))
-IMAGE_LOW_THRESHOLD = float(os.getenv("IMAGE_LOW_THRESHOLD", "0.30"))
+# Ngưỡng cũ 0.42 quá cao với ảnh chụp màn hình / ảnh crop từ app.
+# Log của bạn có bestScore khoảng 0.27 - 0.28 nên để 0.24 hợp lý hơn.
+IMAGE_MATCH_THRESHOLD = float(os.getenv("IMAGE_MATCH_THRESHOLD", "0.24"))
+IMAGE_LOW_THRESHOLD = float(os.getenv("IMAGE_LOW_THRESHOLD", "0.18"))
 MAX_IMAGE_RESULTS = int(os.getenv("MAX_IMAGE_RESULTS", "12"))
-VISION_ALLOW_WEAK_FALLBACK = os.getenv("VISION_ALLOW_WEAK_FALLBACK", "false").lower() == "true"
+VISION_ALLOW_WEAK_FALLBACK = os.getenv("VISION_ALLOW_WEAK_FALLBACK", "true").lower() == "true"
 
 DOWNLOAD_TIMEOUT = float(os.getenv("DOWNLOAD_TIMEOUT", "12"))
 DOWNLOAD_CONCURRENCY = int(os.getenv("DOWNLOAD_CONCURRENCY", "8"))
+MAX_IMAGES_PER_PRODUCT = int(os.getenv("MAX_IMAGES_PER_PRODUCT", "6"))
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Lưu embedding ảnh ra ổ đĩa để lần sau không phải download/encode lại.
+EMBEDDING_DATA_DIR = Path(os.getenv("EMBEDDING_DATA_DIR", "./smartcart_ai_data"))
+IMAGE_VECTOR_DIR = EMBEDDING_DATA_DIR / "image_vectors"
+IMAGE_INDEX_META_PATH = EMBEDDING_DATA_DIR / "image_index_meta.json"
+IMAGE_INDEX_MATRIX_PATH = EMBEDDING_DATA_DIR / "image_index_matrix.npy"
+
+EMBEDDING_DATA_DIR.mkdir(parents=True, exist_ok=True)
+IMAGE_VECTOR_DIR.mkdir(parents=True, exist_ok=True)
 
 DETECTION_LABELS = [
     "a product",
@@ -85,11 +99,12 @@ _product_meta: Dict[int, "ProductCandidate"] = {}
 _product_ids: List[int] = []
 _product_text_embeddings: Optional[np.ndarray] = None
 
+# Mỗi productId có thể xuất hiện nhiều lần vì 1 sản phẩm có nhiều ảnh/vector.
 _image_product_ids: List[int] = []
 _product_image_embeddings: Optional[np.ndarray] = None
 
-# URL ảnh -> vector ảnh, tự hết hạn sau 6 tiếng, tối đa 500 ảnh
-_image_embedding_cache: TTLCache = TTLCache(maxsize=500, ttl=60 * 60 * 6)
+# RAM cache: URL ảnh -> List vector ảnh.
+_image_embedding_cache: TTLCache = TTLCache(maxsize=3000, ttl=60 * 60 * 12)
 
 
 # =========================
@@ -100,6 +115,7 @@ class ProductCandidate(BaseModel):
     productId: int
     text: str = ""
     imageUrl: Optional[str] = None
+    imageUrls: List[str] = []
     soldCount: int = 0
     rating: float = 0.0
     reviewCount: int = 0
@@ -170,6 +186,11 @@ def get_vision_model():
 async def lifespan(app: FastAPI):
     print("AI Service starting...")
     await asyncio.to_thread(load_all_models)
+
+    # Load lại index ảnh đã lưu trước đó.
+    # Nếu file tồn tại thì search ảnh có thể chạy ngay, không cần download lại toàn bộ ảnh.
+    await asyncio.to_thread(load_image_index_state)
+
     print("AI Service ready.")
     yield
     print("AI Service stopped.")
@@ -182,7 +203,7 @@ app = FastAPI(
 
 
 # =========================
-# UTILS
+# BASIC UTILS
 # =========================
 
 def safe_int(value: Any, default: int = 0) -> int:
@@ -260,16 +281,95 @@ def paginate(items: List[RecommendItem], page: int, size: int) -> RecommendRespo
     )
 
 
+def clean_url(url: str) -> str:
+    return str(url or "").strip().replace("\\", "")
+
+
+def split_image_urls(value: Any) -> List[str]:
+    if value is None:
+        return []
+
+    if isinstance(value, list):
+        raw_items = value
+    else:
+        raw = str(value or "").strip()
+
+        if not raw:
+            return []
+
+        if raw.startswith("[") and raw.endswith("]"):
+            try:
+                raw_items = json.loads(raw)
+            except Exception:
+                raw_items = raw.replace("[", "").replace("]", "").replace('"', "").split(",")
+        else:
+            raw_items = raw.split(",")
+
+    urls: List[str] = []
+
+    for item in raw_items:
+        url = clean_url(str(item or "").strip().replace('"', ""))
+
+        if not url:
+            continue
+
+        if url.startswith("http://") or url.startswith("https://"):
+            urls.append(url)
+
+    result: List[str] = []
+    seen = set()
+
+    for url in urls:
+        if url in seen:
+            continue
+
+        seen.add(url)
+        result.append(url)
+
+    return result
+
+
+def get_candidate_image_urls(candidate: ProductCandidate) -> List[str]:
+    urls: List[str] = []
+
+    urls.extend(split_image_urls(candidate.imageUrl))
+    urls.extend(split_image_urls(candidate.imageUrls))
+
+    result: List[str] = []
+    seen = set()
+
+    for url in urls:
+        if url in seen:
+            continue
+
+        seen.add(url)
+        result.append(url)
+
+        if len(result) >= MAX_IMAGES_PER_PRODUCT:
+            break
+
+    return result
+
+
+# =========================
+# PARSE CANDIDATES
+# =========================
+
 def parse_candidate(raw: Dict[str, Any]) -> Optional[ProductCandidate]:
     product_id = raw.get("productId") or raw.get("id")
 
     if product_id is None:
         return None
 
+    image_urls: List[str] = []
+    image_urls.extend(split_image_urls(raw.get("imageUrl")))
+    image_urls.extend(split_image_urls(raw.get("imageUrls")))
+
     return ProductCandidate(
         productId=safe_int(product_id),
         text=str(raw.get("text") or ""),
         imageUrl=raw.get("imageUrl"),
+        imageUrls=image_urls,
         soldCount=safe_int(raw.get("soldCount"), 0),
         rating=safe_float(raw.get("rating"), 0.0),
         reviewCount=safe_int(raw.get("reviewCount"), 0)
@@ -303,9 +403,9 @@ def parse_candidates(raw_candidates: Any) -> List[ProductCandidate]:
     return result
 
 
-def clean_url(url: str) -> str:
-    return str(url or "").strip().replace("\\", "")
-
+# =========================
+# IMAGE PROCESSING
+# =========================
 
 def center_crop_square(image: Image.Image) -> Image.Image:
     image = image.convert("RGB")
@@ -410,6 +510,50 @@ def crop_main_product(image: Image.Image) -> Tuple[Image.Image, str, float]:
         return center_crop_square(image), "center-crop", 0.0
 
 
+def make_visual_views(image: Image.Image) -> List[Tuple[Image.Image, str]]:
+    image = image.convert("RGB")
+
+    views: List[Tuple[Image.Image, str]] = []
+
+    views.append((image, "full"))
+    views.append((center_crop_square(image), "center"))
+
+    try:
+        cropped, label, score = crop_main_product(image)
+
+        if cropped is not None:
+            views.append((cropped, f"detected-{label}-{round(score, 3)}"))
+
+    except Exception as e:
+        print("MAKE VISUAL VIEWS DETECT ERROR:", repr(e))
+
+    result: List[Tuple[Image.Image, str]] = []
+    seen = set()
+
+    for view, name in views:
+        if view is None:
+            continue
+
+        w, h = view.size
+
+        if w < 40 or h < 40:
+            continue
+
+        key = (w // 10, h // 10, name.split("-")[0])
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        result.append((view.convert("RGB"), name))
+
+    return result
+
+
+# =========================
+# ENCODERS
+# =========================
+
 def encode_texts_sync(texts: List[str]) -> np.ndarray:
     return get_text_model().encode(
         texts,
@@ -441,6 +585,224 @@ def encode_image_sync(image: Image.Image) -> np.ndarray:
     return l2_normalize(vector)
 
 
+def build_image_vectors_sync(image: Image.Image) -> List[np.ndarray]:
+    vectors: List[np.ndarray] = []
+
+    image = image.convert("RGB")
+
+    try:
+        views = make_visual_views(image)
+
+        for view_image, view_name in views:
+            vector = encode_image_sync(view_image)
+            vectors.append(l2_normalize(vector.astype("float32")))
+
+    except Exception as e:
+        print("BUILD IMAGE VECTORS ERROR:", repr(e))
+
+    return vectors
+
+
+# =========================
+# PERSISTENT IMAGE CACHE
+# =========================
+
+def image_cache_key(url: str) -> str:
+    raw = f"{VISION_MODEL_NAME}|{clean_url(url)}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def image_vector_cache_path(url: str) -> Path:
+    return IMAGE_VECTOR_DIR / f"{image_cache_key(url)}.npz"
+
+
+def load_image_vectors_from_disk(url: str) -> Optional[List[np.ndarray]]:
+    path = image_vector_cache_path(url)
+
+    if not path.exists():
+        return None
+
+    try:
+        data = np.load(path)
+        vectors: List[np.ndarray] = []
+
+        for key in sorted(data.files):
+            vector = data[key].astype("float32")
+            vector = l2_normalize(vector)
+            vectors.append(vector)
+
+        if not vectors:
+            return None
+
+        return vectors
+
+    except Exception as e:
+        print("LOAD IMAGE VECTOR CACHE ERROR:", url, repr(e))
+        return None
+
+
+def save_image_vectors_to_disk(url: str, vectors: List[np.ndarray]) -> None:
+    if not vectors:
+        return
+
+    path = image_vector_cache_path(url)
+    tmp_path = path.with_suffix(".tmp.npz")
+
+    try:
+        arrays = {
+            f"v{i}": l2_normalize(vector.astype("float32"))
+            for i, vector in enumerate(vectors)
+        }
+
+        np.savez_compressed(tmp_path, **arrays)
+        os.replace(tmp_path, path)
+
+    except Exception as e:
+        print("SAVE IMAGE VECTOR CACHE ERROR:", url, repr(e))
+
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
+
+
+def candidate_to_dict(candidate: ProductCandidate) -> Dict[str, Any]:
+    return {
+        "productId": candidate.productId,
+        "text": candidate.text,
+        "imageUrl": candidate.imageUrl,
+        "imageUrls": candidate.imageUrls,
+        "soldCount": candidate.soldCount,
+        "rating": candidate.rating,
+        "reviewCount": candidate.reviewCount,
+    }
+
+
+def save_image_index_state() -> None:
+    global _product_image_embeddings
+    global _image_product_ids
+    global _product_meta
+
+    try:
+        if _product_image_embeddings is None or not _image_product_ids:
+            return
+
+        np.save(IMAGE_INDEX_MATRIX_PATH, _product_image_embeddings.astype("float32"))
+
+        meta = {
+            "visionModel": VISION_MODEL_NAME,
+            "imageProductIds": _image_product_ids,
+            "productMeta": {
+                str(product_id): candidate_to_dict(candidate)
+                for product_id, candidate in _product_meta.items()
+            }
+        }
+
+        with open(IMAGE_INDEX_META_PATH, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False)
+
+        print(
+            "SAVE IMAGE INDEX STATE:",
+            "vectors =", len(_image_product_ids),
+            "products =", len(set(_image_product_ids))
+        )
+
+    except Exception as e:
+        print("SAVE IMAGE INDEX STATE ERROR:", repr(e))
+
+
+def load_image_index_state() -> None:
+    global _product_meta
+    global _image_product_ids
+    global _product_image_embeddings
+
+    try:
+        if not IMAGE_INDEX_META_PATH.exists():
+            return
+
+        if not IMAGE_INDEX_MATRIX_PATH.exists():
+            return
+
+        with open(IMAGE_INDEX_META_PATH, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+
+        if meta.get("visionModel") != VISION_MODEL_NAME:
+            print("SKIP IMAGE INDEX STATE: vision model changed")
+            return
+
+        matrix = np.load(IMAGE_INDEX_MATRIX_PATH).astype("float32")
+
+        image_product_ids = [
+            safe_int(x)
+            for x in meta.get("imageProductIds", [])
+            if safe_int(x) > 0
+        ]
+
+        if len(image_product_ids) != len(matrix):
+            print("SKIP IMAGE INDEX STATE: ids/matrix size mismatch")
+            return
+
+        product_meta: Dict[int, ProductCandidate] = {}
+
+        raw_product_meta = meta.get("productMeta", {})
+
+        if isinstance(raw_product_meta, dict):
+            for _, raw in raw_product_meta.items():
+                if not isinstance(raw, dict):
+                    continue
+
+                candidate = parse_candidate(raw)
+
+                if candidate is not None and candidate.productId > 0:
+                    product_meta[candidate.productId] = candidate
+
+        _product_meta = product_meta
+        _image_product_ids = image_product_ids
+        _product_image_embeddings = matrix
+
+        print(
+            "LOAD IMAGE INDEX STATE:",
+            "vectors =", len(_image_product_ids),
+            "products =", len(set(_image_product_ids))
+        )
+
+    except Exception as e:
+        print("LOAD IMAGE INDEX STATE ERROR:", repr(e))
+
+
+def clear_persistent_image_cache() -> Dict[str, Any]:
+    removed_files = 0
+
+    try:
+        if IMAGE_VECTOR_DIR.exists():
+            for file in IMAGE_VECTOR_DIR.glob("*.npz"):
+                try:
+                    file.unlink()
+                    removed_files += 1
+                except Exception:
+                    pass
+
+        if IMAGE_INDEX_META_PATH.exists():
+            IMAGE_INDEX_META_PATH.unlink()
+
+        if IMAGE_INDEX_MATRIX_PATH.exists():
+            IMAGE_INDEX_MATRIX_PATH.unlink()
+
+    except Exception as e:
+        print("CLEAR PERSISTENT IMAGE CACHE ERROR:", repr(e))
+
+    return {
+        "removedVectorFiles": removed_files,
+        "metaDeleted": not IMAGE_INDEX_META_PATH.exists(),
+        "matrixDeleted": not IMAGE_INDEX_MATRIX_PATH.exists()
+    }
+
+
+# =========================
+# DOWNLOAD IMAGE
+# =========================
+
 async def download_image_async(
         client: httpx.AsyncClient,
         url: str,
@@ -455,23 +817,47 @@ async def download_image_async(
         print("DOWNLOAD INVALID URL:", url)
         return None
 
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/126.0.0.0 Safari/537.36"
+        ),
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": "https://www.google.com/",
+        "Connection": "keep-alive",
+    }
+
     async with semaphore:
         try:
             response = await client.get(
                 url,
                 timeout=DOWNLOAD_TIMEOUT,
-                headers={"User-Agent": "Mozilla/5.0 SmartCartAI/1.0"}
+                headers=headers,
+                follow_redirects=True
             )
 
             print("DOWNLOAD IMAGE:", url, "status =", response.status_code)
 
             response.raise_for_status()
+
+            content_type = response.headers.get("content-type", "")
+
+            if "image" not in content_type.lower():
+                print("DOWNLOAD NOT IMAGE:", url, "content-type =", content_type)
+                return None
+
             return Image.open(BytesIO(response.content)).convert("RGB")
 
         except Exception as e:
             print("DOWNLOAD IMAGE ERROR:", url, repr(e))
             return None
 
+
+# =========================
+# REASON BUILDERS
+# =========================
 
 def build_text_reason(semantic: float, sold_score: float, rating_score: float) -> str:
     if semantic >= 0.72:
@@ -489,14 +875,12 @@ def build_text_reason(semantic: float, sold_score: float, rating_score: float) -
     return "AI gợi ý dựa trên thông tin sản phẩm"
 
 
-def build_image_reason(score: float, detected_label: str) -> str:
-    if detected_label and detected_label != "center-crop":
-        if score >= 0.55:
-            return f"AI nhận diện vùng {detected_label} và tìm thấy sản phẩm rất giống"
-        return f"AI nhận diện vùng {detected_label} và tìm thấy sản phẩm gần giống"
+def build_image_reason(score: float) -> str:
+    if score >= 0.50:
+        return "Tìm thấy sản phẩm có hình ảnh rất giống ảnh bạn tải lên"
 
-    if score >= 0.55:
-        return "Sản phẩm có hình ảnh rất giống ảnh bạn tải lên"
+    if score >= IMAGE_MATCH_THRESHOLD:
+        return "Tìm thấy sản phẩm có hình ảnh giống ảnh bạn tải lên"
 
     return "Sản phẩm có hình ảnh gần giống ảnh bạn tải lên"
 
@@ -523,6 +907,7 @@ async def rebuild_index(candidates: List[ProductCandidate]) -> Dict[str, Any]:
         _product_meta = {c.productId: c for c in candidates}
         _product_ids = [c.productId for c in candidates]
 
+        # ---------- TEXT INDEX ----------
         text_candidates = [
             c for c in candidates
             if c.text is not None and c.text.strip()
@@ -537,53 +922,89 @@ async def rebuild_index(candidates: List[ProductCandidate]) -> Dict[str, Any]:
             _product_ids = []
             _product_text_embeddings = None
 
-        image_candidates = [
-            c for c in candidates
-            if c.imageUrl is not None and clean_url(c.imageUrl)
-        ]
+        # ---------- IMAGE INDEX ----------
+        image_jobs: List[Tuple[ProductCandidate, str]] = []
+
+        for candidate in candidates:
+            for url in get_candidate_image_urls(candidate):
+                image_jobs.append((candidate, url))
 
         image_ids: List[int] = []
         image_vectors: List[np.ndarray] = []
 
-        need_download: List[ProductCandidate] = []
+        need_download: List[Tuple[ProductCandidate, str]] = []
 
-        for candidate in image_candidates:
-            url = clean_url(candidate.imageUrl or "")
+        cache_hit = 0
+        cache_miss = 0
 
-            cached = _image_embedding_cache.get(url)
+        for candidate, url in image_jobs:
+            # 1. RAM cache
+            ram_cached = _image_embedding_cache.get(url)
 
-            if cached is not None:
-                image_ids.append(candidate.productId)
-                image_vectors.append(cached)
-            else:
-                need_download.append(candidate)
+            if ram_cached is not None:
+                vectors = ram_cached if isinstance(ram_cached, list) else [ram_cached]
+
+                for vector in vectors:
+                    image_ids.append(candidate.productId)
+                    image_vectors.append(l2_normalize(vector.astype("float32")))
+
+                cache_hit += 1
+                continue
+
+            # 2. Disk cache
+            disk_cached_vectors = load_image_vectors_from_disk(url)
+
+            if disk_cached_vectors is not None:
+                _image_embedding_cache[url] = disk_cached_vectors
+
+                for vector in disk_cached_vectors:
+                    image_ids.append(candidate.productId)
+                    image_vectors.append(l2_normalize(vector.astype("float32")))
+
+                cache_hit += 1
+                continue
+
+            # 3. Download nếu chưa có cache
+            need_download.append((candidate, url))
+            cache_miss += 1
 
         semaphore = asyncio.Semaphore(DOWNLOAD_CONCURRENCY)
 
         async with httpx.AsyncClient(follow_redirects=True) as client:
             tasks = [
-                download_image_async(client, clean_url(c.imageUrl or ""), semaphore)
-                for c in need_download
+                download_image_async(client, url, semaphore)
+                for _, url in need_download
             ]
 
             downloaded_images = await asyncio.gather(*tasks)
 
-        for candidate, image in zip(need_download, downloaded_images):
+        download_ok = 0
+        download_fail = 0
+
+        for (candidate, url), image in zip(need_download, downloaded_images):
             if image is None:
+                download_fail += 1
                 continue
 
             try:
-                product_image, _, _ = await asyncio.to_thread(crop_main_product, image)
-                vector = await asyncio.to_thread(encode_image_sync, product_image)
+                vectors = await asyncio.to_thread(build_image_vectors_sync, image)
 
-                url = clean_url(candidate.imageUrl or "")
-                _image_embedding_cache[url] = vector
+                if not vectors:
+                    download_fail += 1
+                    continue
 
-                image_ids.append(candidate.productId)
-                image_vectors.append(vector)
+                _image_embedding_cache[url] = vectors
+                save_image_vectors_to_disk(url, vectors)
+
+                for vector in vectors:
+                    image_ids.append(candidate.productId)
+                    image_vectors.append(l2_normalize(vector.astype("float32")))
+
+                download_ok += 1
 
             except Exception as e:
-                print("INDEX IMAGE ENCODE ERROR:", candidate.productId, repr(e))
+                download_fail += 1
+                print("INDEX IMAGE ENCODE ERROR:", candidate.productId, url, repr(e))
 
         _image_product_ids = image_ids
 
@@ -592,17 +1013,35 @@ async def rebuild_index(candidates: List[ProductCandidate]) -> Dict[str, Any]:
         else:
             _product_image_embeddings = None
 
+        save_image_index_state()
+
+        print(
+            "IMAGE EMBEDDING CACHE:",
+            "jobs =", len(image_jobs),
+            "hit =", cache_hit,
+            "miss =", cache_miss,
+            "downloadOk =", download_ok,
+            "downloadFail =", download_fail,
+            "diskDir =", str(IMAGE_VECTOR_DIR)
+        )
+
         print(
             "INDEX REBUILD DONE:",
             "textProducts =", len(_product_ids),
-            "imageProducts =", len(_image_product_ids)
+            "imageVectors =", len(_image_product_ids),
+            "imageProducts =", len(set(_image_product_ids))
         )
 
         return {
             "status": "ok",
             "totalProducts": len(candidates),
             "textProducts": len(_product_ids),
-            "imageProducts": len(_image_product_ids)
+            "imageVectors": len(_image_product_ids),
+            "imageProducts": len(set(_image_product_ids)),
+            "cacheHit": cache_hit,
+            "cacheMiss": cache_miss,
+            "downloadOk": download_ok,
+            "downloadFail": download_fail,
         }
 
 
@@ -614,14 +1053,21 @@ async def rebuild_index(candidates: List[ProductCandidate]) -> Dict[str, Any]:
 def health():
     return {
         "status": "ok",
-        "version": "smartcart-ai-async-cache-vector-index",
+        "version": "smartcart-ai-persistent-image-embedding",
         "device": DEVICE,
         "textModel": TEXT_MODEL_NAME,
         "detectorModel": DETECT_MODEL_NAME,
         "visionModel": VISION_MODEL_NAME,
+        "imageMatchThreshold": IMAGE_MATCH_THRESHOLD,
+        "imageLowThreshold": IMAGE_LOW_THRESHOLD,
+        "weakFallback": VISION_ALLOW_WEAK_FALLBACK,
         "indexedTextProducts": len(_product_ids),
-        "indexedImageProducts": len(_image_product_ids),
-        "imageCacheSize": len(_image_embedding_cache),
+        "indexedImageVectors": len(_image_product_ids),
+        "indexedImageProducts": len(set(_image_product_ids)),
+        "imageRamCacheSize": len(_image_embedding_cache),
+        "imageEmbeddingDir": str(IMAGE_VECTOR_DIR),
+        "imageIndexMetaExists": IMAGE_INDEX_META_PATH.exists(),
+        "imageIndexMatrixExists": IMAGE_INDEX_MATRIX_PATH.exists(),
     }
 
 
@@ -804,48 +1250,79 @@ async def process_visual_search(
         return empty_response(page, size)
 
     try:
-        cropped_query, detected_label, detect_score = await asyncio.to_thread(
-            crop_main_product,
-            query_image
-        )
+        query_views = await asyncio.to_thread(make_visual_views, query_image)
 
-        query_embedding = await asyncio.to_thread(
-            encode_image_sync,
-            cropped_query
-        )
+        query_vectors: List[np.ndarray] = []
+
+        for view_image, view_name in query_views:
+            vector = await asyncio.to_thread(encode_image_sync, view_image)
+            query_vectors.append(l2_normalize(vector.astype("float32")))
+
+        if not query_vectors:
+            print("VISUAL SEARCH: no query vectors")
+            return empty_response(page, size)
 
     except Exception as e:
         print("VISUAL SEARCH PREPARE ERROR:", repr(e))
         return empty_response(page, size)
 
-    scores = cosine_similarity_matrix(_product_image_embeddings, query_embedding)
+    max_sold = max([c.soldCount for c in _product_meta.values()], default=0)
 
-    scored_items = []
+    best_by_product: Dict[int, Tuple[float, float]] = {}
 
-    for index, product_id in enumerate(_image_product_ids):
-        image_score = max(float(scores[index]), 0.0)
+    for query_vector in query_vectors:
+        scores = cosine_similarity_matrix(_product_image_embeddings, query_vector)
 
-        candidate = _product_meta.get(product_id)
+        for index, product_id in enumerate(_image_product_ids):
+            image_score = max(float(scores[index]), 0.0)
 
-        if candidate is None:
-            continue
+            candidate = _product_meta.get(product_id)
 
-        sold_score = normalize_number(
-            float(candidate.soldCount),
-            max([c.soldCount for c in _product_meta.values()], default=0)
-        )
+            if candidate is None:
+                continue
 
-        rating_score = normalize_number(float(candidate.rating), 5.0)
+            sold_score = normalize_number(
+                float(candidate.soldCount),
+                float(max_sold)
+            )
 
-        final_score = (
-            image_score * 0.90
-            + rating_score * 0.07
-            + sold_score * 0.03
-        )
+            rating_score = normalize_number(float(candidate.rating), 5.0)
 
-        scored_items.append((product_id, image_score, final_score))
+            final_score = (
+                image_score * 0.92
+                + rating_score * 0.05
+                + sold_score * 0.03
+            )
+
+            old = best_by_product.get(product_id)
+
+            if old is None or final_score > old[1]:
+                best_by_product[product_id] = (image_score, final_score)
+
+    scored_items = [
+        (product_id, image_score, final_score)
+        for product_id, (image_score, final_score) in best_by_product.items()
+    ]
 
     scored_items.sort(key=lambda x: x[2], reverse=True)
+
+    if not scored_items:
+        print("VISUAL SEARCH: no scored items")
+        return empty_response(page, size)
+
+    best_score = scored_items[0][1]
+
+    print(
+        "VISUAL SEARCH TOP:",
+        [
+            {
+                "productId": item[0],
+                "imageScore": round(item[1], 4),
+                "finalScore": round(item[2], 4),
+            }
+            for item in scored_items[:8]
+        ]
+    )
 
     matched = [
         item for item in scored_items
@@ -853,17 +1330,17 @@ async def process_visual_search(
     ]
 
     if not matched and VISION_ALLOW_WEAK_FALLBACK:
-        matched = [
-            item for item in scored_items
-            if item[1] >= IMAGE_LOW_THRESHOLD
-        ][:5]
+        if best_score >= IMAGE_LOW_THRESHOLD:
+            matched = scored_items[:MAX_IMAGE_RESULTS]
 
     if not matched:
         print(
             "VISUAL SEARCH: no confident match",
-            "bestScore =", round(scored_items[0][1], 4) if scored_items else 0,
-            "detected =", detected_label,
-            "detectScore =", round(detect_score, 4)
+            "bestScore =", round(best_score, 4),
+            "threshold =", IMAGE_MATCH_THRESHOLD,
+            "lowThreshold =", IMAGE_LOW_THRESHOLD,
+            "indexedVectors =", len(_image_product_ids),
+            "indexedProducts =", len(set(_image_product_ids))
         )
         return empty_response(page, size)
 
@@ -874,29 +1351,67 @@ async def process_visual_search(
             RecommendItem(
                 productId=product_id,
                 score=round(final_score * 100, 2),
-                reason=build_image_reason(image_score, detected_label)
+                reason=build_image_reason(image_score)
             )
         )
 
     print(
         "VISUAL SEARCH RESULT:",
-        "indexed =", len(_image_product_ids),
+        "indexedVectors =", len(_image_product_ids),
+        "indexedProducts =", len(set(_image_product_ids)),
         "matched =", len(results),
-        "detected =", detected_label,
-        "detectScore =", round(detect_score, 4)
+        "bestScore =", round(best_score, 4)
     )
 
-    if not results:
-        return empty_response(page, size)
-
     return paginate(results, page, size)
+
+
+@app.get("/debug/image-index")
+def debug_image_index():
+    indexed_products = []
+
+    for product_id in sorted(set(_image_product_ids)):
+        meta = _product_meta.get(product_id)
+
+        indexed_products.append({
+            "productId": product_id,
+            "text": meta.text[:150] if meta and meta.text else "",
+            "imageUrl": meta.imageUrl if meta else "",
+            "imageUrls": meta.imageUrls if meta else [],
+            "vectorCount": _image_product_ids.count(product_id)
+        })
+
+    return {
+        "indexedVectors": len(_image_product_ids),
+        "indexedProducts": len(set(_image_product_ids)),
+        "totalProducts": len(_product_meta),
+        "products": indexed_products
+    }
+
+
+@app.get("/debug/image-cache")
+def debug_image_cache():
+    vector_files = list(IMAGE_VECTOR_DIR.glob("*.npz"))
+
+    return {
+        "ramCacheSize": len(_image_embedding_cache),
+        "diskVectorFiles": len(vector_files),
+        "indexedImageVectors": len(_image_product_ids),
+        "indexedImageProducts": len(set(_image_product_ids)),
+        "imageEmbeddingDir": str(IMAGE_VECTOR_DIR),
+        "imageIndexMetaExists": IMAGE_INDEX_META_PATH.exists(),
+        "imageIndexMatrixExists": IMAGE_INDEX_MATRIX_PATH.exists(),
+    }
 
 
 @app.post("/cache/clear")
 def clear_cache():
     _image_embedding_cache.clear()
 
+    persistent = clear_persistent_image_cache()
+
     return {
         "status": "ok",
-        "message": "image cache cleared"
+        "message": "image cache cleared",
+        "persistent": persistent
     }
