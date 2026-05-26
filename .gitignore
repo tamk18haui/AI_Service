@@ -1,0 +1,18 @@
+# Môi trường ảo
+.venv/
+venv/
+env/
+
+# Cache Python
+__pycache__/
+*.pyc
+
+# File lớn bạn đã gặp lỗi
+ToanBoCodeAI.txt
+*.dll
+*.lib
+*.exe
+
+# File hệ thống
+.DS_Store
+*.txt
